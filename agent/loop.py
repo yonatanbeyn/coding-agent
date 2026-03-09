@@ -21,6 +21,7 @@ from agent.context import build_context
 from agent.llm.base import LLMResponse, ToolCall
 from agent.tools.registry import ToolRegistry
 from agent.permissions import Decision, PermissionManager
+from agent.session import save_workspace
 
 console = Console()
 
@@ -74,6 +75,7 @@ class AgentLoop:
 
     def interactive(self) -> None:
         """Start an interactive REPL session."""
+        save_workspace(self.config.workspace)
         context = build_context(self.config.workspace)
 
         console.print(Panel.fit(
@@ -82,8 +84,8 @@ class AgentLoop:
             f"Model: [green]{self.config.model}[/green]\n"
             f"Workspace: [dim]{self.config.workspace}[/dim]\n"
             f"Tools: [yellow]{len(self.registry.all())}[/yellow] available\n\n"
-            f"[dim]Type [bold]/exit[/bold] to quit · [bold]/clear[/bold] to reset · "
-            f"[bold]/tools[/bold] to list tools · [bold]/permissions[/bold] to review session permissions[/dim]",
+            f"[dim]Ctrl+C to interrupt · Ctrl+C twice to exit · "
+            f"[bold]/tools[/bold] · [bold]/permissions[/bold] · [bold]/help[/bold][/dim]",
             title="[bold]Welcome[/bold]",
             border_style="cyan",
         ))
@@ -97,12 +99,23 @@ class AgentLoop:
             "content": "Understood. I have your workspace context. What would you like to build?",
         })
 
+        _last_interrupt = 0.0
+
         while True:
             try:
                 user_input = console.input("[bold green]You>[/bold green] ").strip()
-            except (EOFError, KeyboardInterrupt):
+                _last_interrupt = 0.0  # reset on successful input
+            except EOFError:
                 console.print("\n[dim]Goodbye.[/dim]")
                 break
+            except KeyboardInterrupt:
+                now = time.time()
+                if now - _last_interrupt < 2.0:
+                    console.print("\n[dim]Goodbye.[/dim]")
+                    break
+                _last_interrupt = now
+                console.print("\n[dim]Press Ctrl+C again to exit.[/dim]")
+                continue
 
             if not user_input:
                 continue
@@ -115,7 +128,13 @@ class AgentLoop:
 
             self.history.append({"role": "user", "content": user_input})
             console.print()
-            self._loop()
+            try:
+                self._loop()
+            except KeyboardInterrupt:
+                console.print("\n[yellow]Interrupted.[/yellow] Returning to prompt…")
+                # Remove the unanswered user message so history stays clean
+                if self.history and self.history[-1]["role"] == "user":
+                    self.history.pop()
             console.print()
 
     # ──────────────────────────────────────────────────────────────
@@ -136,7 +155,6 @@ class AgentLoop:
 
             try:
                 if self.config.stream and hasattr(self.client, "complete_after_stream"):
-                    # Stream text to terminal, then get the full response
                     response = self._stream_response(messages, tools)
                 else:
                     response = self.client.complete(
@@ -147,6 +165,8 @@ class AgentLoop:
                     )
                     if response.content:
                         console.print(Markdown(response.content))
+            except KeyboardInterrupt:
+                raise  # let interactive() catch it
             except Exception as e:
                 console.print(f"[red]LLM error:[/red] {e}")
                 break
@@ -325,6 +345,40 @@ class AgentLoop:
             console.print(f"Workspace: [cyan]{self.config.workspace}[/cyan]")
             return True
 
+        if c == "/cd":
+            if len(parts) < 2:
+                console.print("[dim]Usage: /cd <path>[/dim]")
+                return True
+            import os as _os
+            new_path = _os.path.abspath(parts[1])
+            if not _os.path.isdir(new_path):
+                console.print(f"[red]Not a directory:[/red] {new_path}")
+                return True
+            self.config.workspace = new_path
+            self.registry = ToolRegistry(new_path, enable_aws=self.config.enable_aws)
+            save_workspace(new_path)
+            context = build_context(new_path)
+            self.history.append({"role": "user", "content": f"I switched workspace to:\n{context}"})
+            self.history.append({"role": "assistant", "content": f"Switched workspace to `{new_path}`."})
+            console.print(f"[green]Workspace → {new_path}[/green]")
+            return True
+
+        if c in ("/help", "/?"):
+            console.print(Rule("[bold]Commands[/bold]"))
+            cmds = [
+                ("/cd <path>",      "Switch workspace directory"),
+                ("/workspace",      "Show current workspace"),
+                ("/tools",          "List all available tools"),
+                ("/permissions",    "Show session allow/deny list"),
+                ("/tokens",         "Show token usage"),
+                ("/history",        "Show conversation history"),
+                ("/clear",          "Reset conversation"),
+                ("/exit",           "Quit (or Ctrl+C twice)"),
+            ]
+            for name, desc in cmds:
+                console.print(f"  [cyan]{name:<20}[/cyan] {desc}")
+            return True
+
         if c == "/permissions":
             console.print(Rule("[bold]Session Permissions[/bold]"))
             allowed = self.permissions.always_allowed
@@ -341,8 +395,5 @@ class AgentLoop:
                 console.print("  [dim]No session overrides yet.[/dim]")
             return True
 
-        console.print(
-            f"[yellow]Unknown command:[/yellow] {cmd}\n"
-            f"[dim]Commands: /exit /clear /tools /tokens /history /workspace /permissions[/dim]"
-        )
+        console.print(f"[yellow]Unknown command:[/yellow] {cmd}  [dim](type /help for list)[/dim]")
         return True

@@ -21,6 +21,7 @@ except ImportError:
 
 from config import Config
 from agent.loop import AgentLoop
+from agent.session import load_last_workspace
 
 
 def main() -> None:
@@ -97,6 +98,11 @@ Examples:
             print(f"Error: workspace directory does not exist: {path}", file=sys.stderr)
             sys.exit(1)
         config.workspace = path
+    else:
+        # Restore last used workspace if the user didn't cd or specify one
+        last = load_last_workspace()
+        if last and last != os.getcwd():
+            config.workspace = last
 
     if args.max_iterations:
         config.max_iterations = args.max_iterations
