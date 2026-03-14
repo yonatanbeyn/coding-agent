@@ -34,6 +34,14 @@ _DEFAULT_TIERS: dict[str, PermissionTier] = {
     "git_diff":             PermissionTier.AUTO_ALLOW,
     "git_log":              PermissionTier.AUTO_ALLOW,
 
+    # ── GUI automation (always ask — controls the whole screen) ──
+    "open_app":                PermissionTier.ASK,
+    "mouse_click":             PermissionTier.ASK,
+    "keyboard_type":           PermissionTier.ASK,
+    "keyboard_hotkey":         PermissionTier.ASK,
+    "vision_find":             PermissionTier.ASK,
+    "screenshot":              PermissionTier.AUTO_ALLOW,  # read-only
+
     # ── Ask (write / execute / install / network) ─────────────────
     "write_file":              PermissionTier.ASK,
     "run_shell":               PermissionTier.ASK,

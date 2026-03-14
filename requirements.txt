@@ -10,3 +10,7 @@ rich>=13.7.0
 
 # Environment
 python-dotenv>=1.0.0
+
+# GUI automation
+pyautogui>=0.9.54
+pillow>=10.0.0

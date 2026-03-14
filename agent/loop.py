@@ -64,19 +64,35 @@ class AgentLoop:
     def run(self, user_prompt: str) -> str:
         """Run the agent on a single prompt. Returns the final assistant message."""
         context = build_context(self.config.workspace)
-        enriched = f"{context}\n\n---\n\nTask: {user_prompt}"
+        # Provide workspace context as a separate system-style message so the
+        # agent has it available without feeling compelled to re-explore files.
+        self.history.append({
+            "role": "user",
+            "content": (
+                f"Workspace context (for reference only — do NOT read files, infer endpoints, "
+                f"or use this project's details unless the user's task explicitly involves modifying or reading code):\n{context}"
+            ),
+        })
+        self.history.append({
+            "role": "assistant",
+            "content": "Got it. Ready.",
+        })
+        self.history.append({"role": "user", "content": user_prompt})
 
-        self.history.append({"role": "user", "content": enriched})
         console.print(Rule(f"[bold cyan]Agent[/bold cyan] · {self.config.provider}/{self.config.model}"))
         console.print(f"[dim]Workspace:[/dim] {self.config.workspace}")
         console.print()
 
         return self._loop()
 
-    def interactive(self) -> None:
-        """Start an interactive REPL session."""
+    def interactive(self, skip_context_inject: bool = False) -> None:
+        """Start an interactive REPL session.
+
+        Args:
+            skip_context_inject: If True, skip the initial context injection
+                (used when continuing after a one-shot run that already has history).
+        """
         save_workspace(self.config.workspace)
-        context = build_context(self.config.workspace)
 
         console.print(Panel.fit(
             f"[bold cyan]Coding Agent[/bold cyan]\n"
@@ -91,13 +107,13 @@ class AgentLoop:
         ))
         console.print()
 
-        # Inject context once at session start
-        context_msg = f"Session context:\n{context}"
-        self.history.append({"role": "user", "content": context_msg})
-        self.history.append({
-            "role": "assistant",
-            "content": "Understood. I have your workspace context. What would you like to build?",
-        })
+        if not skip_context_inject:
+            context = build_context(self.config.workspace)
+            self.history.append({"role": "user", "content": f"Session context:\n{context}"})
+            self.history.append({
+                "role": "assistant",
+                "content": "Understood. I have your workspace context. What would you like to build?",
+            })
 
         _last_interrupt = 0.0
 
@@ -107,11 +123,13 @@ class AgentLoop:
                 _last_interrupt = 0.0  # reset on successful input
             except EOFError:
                 console.print("\n[dim]Goodbye.[/dim]")
+                self.history.clear()
                 break
             except KeyboardInterrupt:
                 now = time.time()
                 if now - _last_interrupt < 2.0:
                     console.print("\n[dim]Goodbye.[/dim]")
+                    self.history.clear()
                     break
                 _last_interrupt = now
                 console.print("\n[dim]Press Ctrl+C again to exit.[/dim]")
@@ -310,6 +328,7 @@ class AgentLoop:
 
         if c in ("/exit", "/quit", "/q"):
             console.print("[dim]Goodbye.[/dim]")
+            self.history.clear()
             return False
 
         if c == "/clear":

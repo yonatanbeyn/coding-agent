@@ -114,6 +114,8 @@ Examples:
 
     if args.prompt:
         agent.run(" ".join(args.prompt))
+        # Keep looping — don't exit after one-shot; drop into REPL with context intact
+        agent.interactive(skip_context_inject=True)
     else:
         agent.interactive()
 

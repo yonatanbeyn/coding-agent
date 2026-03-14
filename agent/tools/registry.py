@@ -180,6 +180,76 @@ class ToolRegistry:
                 fn=lambda bucket_name: aws.get_s3_bucket_size(bucket_name),
             ))
 
+        # ── GUI automation ─────────────────────────────────────────
+        self._register_gui()
+
+    def _register_gui(self) -> None:
+        from agent.tools import gui
+
+        self.register(ToolDef(
+            name="open_app",
+            description="Open any macOS application by name (Postman, IntelliJ IDEA, Chrome, Slack, etc.).",
+            parameters=gui.OPEN_APP_SCHEMA,
+            fn=lambda name, wait=1.5: gui.open_app(name, wait),
+        ))
+
+        self.register(ToolDef(
+            name="focus_app",
+            description="Bring an already-running app to the foreground. Call this before screenshot when you need to capture a specific app.",
+            parameters=gui.FOCUS_APP_SCHEMA,
+            fn=lambda name, wait=1.0: gui.focus_app(name, wait),
+        ))
+
+        self.register(ToolDef(
+            name="screenshot",
+            description="Take a full-screen screenshot. Returns the file path and screen dimensions. Pass focus='AppName' to bring an app to front first.",
+            parameters=gui.SCREENSHOT_SCHEMA,
+            fn=lambda save_path=None, focus=None: gui.screenshot(save_path, focus),
+        ))
+
+        self.register(ToolDef(
+            name="mouse_click",
+            description="Click at x,y screen coordinates. Use vision_find first to get coordinates.",
+            parameters=gui.MOUSE_CLICK_SCHEMA,
+            fn=lambda x, y, button="left", double=False: gui.mouse_click(x, y, button, double),
+        ))
+
+        self.register(ToolDef(
+            name="click_and_type",
+            description=(
+                "Click a UI element at (x, y) and immediately type text into it — all in one step. "
+                "Use this instead of separate mouse_click + keyboard_type to avoid focus loss between tool calls. "
+                "Pass focus='AppName' to ensure the app is in front first."
+            ),
+            parameters=gui.CLICK_AND_TYPE_SCHEMA,
+            fn=lambda x, y, text, focus=None: gui.click_and_type(x, y, text, focus),
+        ))
+
+        self.register(ToolDef(
+            name="keyboard_type",
+            description="Type text into the currently focused UI element. Handles unicode and special characters.",
+            parameters=gui.KEYBOARD_TYPE_SCHEMA,
+            fn=lambda text, focus=None, clear=True: gui.keyboard_type(text, focus, clear),
+        ))
+
+        self.register(ToolDef(
+            name="keyboard_hotkey",
+            description='Press a key combination. E.g. ["cmd","t"] = new tab, ["cmd","space"] = Spotlight, ["cmd","q"] = quit.',
+            parameters=gui.KEYBOARD_HOTKEY_SCHEMA,
+            fn=lambda keys: gui.keyboard_hotkey(keys),
+        ))
+
+        self.register(ToolDef(
+            name="vision_find",
+            description=(
+                "Take a screenshot and use Claude vision to locate any UI element by description. "
+                "Returns x,y pixel coordinates. Works on any app, system UI, Dock, menu bar. "
+                'Set then_click=true to click immediately. E.g. "URL bar in Postman", "Apple menu icon".'
+            ),
+            parameters=gui.VISION_FIND_SCHEMA,
+            fn=lambda description, then_click=False, focus=None: gui.vision_find(description, then_click, focus),
+        ))
+
     def register(self, tool: ToolDef) -> None:
         self._tools[tool.name] = tool
 
