@@ -81,7 +81,9 @@ class AgentLoop:
     the same way by `delegate_to_agent`.
     """
 
-    MAX_DEPTH = 1  # the main agent may delegate; sub-agents may not delegate further
+    # main agent → team lead → workers. Below the top level only agent skills that
+    # list `delegate_to_agent` in `tools:` can delegate, and never past this depth.
+    MAX_DEPTH = 2
 
     def __init__(
         self,
@@ -91,9 +93,11 @@ class AgentLoop:
         agent_skill: AgentSkill | str | None = None,
         permissions: PermissionManager | None = None,
         depth: int = 0,
+        callers: tuple[str, ...] = (),
     ):
         self.enable_aws = enable_aws
         self.depth = depth
+        self._callers = callers
         self.permissions = permissions or PermissionManager(auto_allow_all=auto_allow_all)
         self.history: list[dict] = []
         self.total_input_tokens = 0
@@ -144,7 +148,9 @@ class AgentLoop:
         self.agent_skills: dict[str, AgentSkill] = {}
         if can_delegate:
             me = self.agent_skill.name if self.agent_skill else None
-            self.agent_skills = {n: a for n, a in all_agents.items() if n != me}
+            # Never offer an agent itself or a caller up the chain (no A → B → A loops).
+            excluded = {me, *self._callers}
+            self.agent_skills = {n: a for n, a in all_agents.items() if n not in excluded}
 
         self.capability_problems = skill_problems + agent_problems
         self.active_skills: list[str] = []
@@ -208,6 +214,7 @@ class AgentLoop:
             agent_skill=target,
             permissions=self.permissions,   # same user, same session approvals
             depth=self.depth + 1,
+            callers=self._callers + ((self.agent_skill.name,) if self.agent_skill else ()),
         )
         sub.history = [{
             "role": "user",

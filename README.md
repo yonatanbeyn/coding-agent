@@ -161,8 +161,33 @@ max-iterations: 25
 You are a senior code reviewer...         # this body is the agent's system prompt
 ```
 
-Sub-agents can't delegate further (one level deep). An agent skill started with `--agent`
-can delegate only if it lists `delegate_to_agent` in `tools`.
+### Multi-agent teams
+
+Delegation goes up to two levels: **main agent → team lead → workers**. Below the top
+level, only agent skills that list `delegate_to_agent` in `tools` can delegate. An agent never
+sees itself or its callers in its catalog, so A → B → A loops are impossible.
+
+Each agent gets its own conversation, LLM client, model and tool allowlist. Teammates share
+nothing except the `task` text, their final answer, and the workspace files. The
+`team-board` skill turns those files into shared memory (`.agent-team/<feature>/board.json`
+and `board.md`).
+
+Bundled example team:
+
+```
+feature-lead   (plans on the board, delegates, loops review → fix; never writes code)
+ ├─ implementer    (writes code + tests for one task)
+ ├─ code-reviewer  (read-only review)
+ └─ api-tester     (curl / Postman checks)
+```
+
+```bash
+python main.py --agent feature-lead "Add a /health endpoint with a test"
+python main.py "Add user login with tests"     # main agent can delegate to feature-lead
+```
+
+Sub-agents run one at a time inside the same process. Delegation blocks until the sub-agent
+finishes. There's no parallel fan-out and no direct agent-to-agent messaging yet.
 
 ---
 
@@ -272,8 +297,11 @@ coding-agent/
 ├── .env.example
 ├── skills/                      # Bundled skills (know-how): <name>/SKILL.md
 │   ├── desktop-gui/
-│   └── aws-inventory/
+│   ├── aws-inventory/
+│   └── team-board/              # shared task board for agent teams (with a script)
 ├── agents/                      # Bundled agent skills (agents): <name>.md
+│   ├── feature-lead.md          # team lead: plans + delegates
+│   ├── implementer.md
 │   ├── code-reviewer.md
 │   └── api-tester.md
 └── agent/
