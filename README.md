@@ -85,11 +85,91 @@ python main.py [prompt] [flags]
   --yes / -y   auto-approve all tool calls (skip permission prompts)
   --no-aws     disable AWS tools
   --no-stream  disable streaming output
+  --agent      run the session as an agent skill (e.g. --agent code-reviewer)
+  --list-skills  list discovered skills and agent skills, then exit
 ```
 
 ---
 
-## Tools (21 total)
+## Skills vs agent skills
+
+This agent can be extended without writing Python, using two kinds of markdown files.
+They do different jobs:
+
+| | **Skill** | **Agent skill** |
+|---|---|---|
+| Defines | *Know-how*: how to do one kind of task | *An agent*: who does the work |
+| File | `<name>/SKILL.md` folder (+ `scripts/`, `reference/`, `assets/`) | One `<name>.md` file |
+| Body is | Instructions loaded into the **current** agent | The **system prompt** of a separate agent |
+| Controls | Which gated tools get unlocked (`allowed-tools`) | Tool allowlist (`tools`), usable skills (`skills`), `model`, `max-iterations` |
+| Context | Shares the current conversation | Gets its own fresh conversation; returns only its final answer |
+| How it is used | The model calls `activate_skill(name)` | The model calls `delegate_to_agent(agent, task)`, or you start with `--agent NAME` |
+| Example | `desktop-gui`: how to drive Postman safely | `api-tester`: an agent that finds routes and tests them, *using* the `desktop-gui` skill |
+| Compatible with | Agent Skills spec: Claude Code, GitHub Copilot skills | Claude Code subagents, GitHub Copilot custom agents |
+
+In one sentence: **a skill is something an agent knows; an agent skill is an agent.**
+Agent skills can list the skills they are allowed to use, so agents are composed from skills.
+
+```
+Main agent (config.SYSTEM_PROMPT + catalogs)
+ ├─ activate_skill("aws-inventory")        → instructions loaded here, AWS tools unlocked
+ └─ delegate_to_agent("api-tester", task)  → new AgentLoop with api-tester.md as its prompt
+       └─ activate_skill("desktop-gui")    → allowed because api-tester lists it in `skills:`
+```
+
+### Where they are discovered
+
+The first one found wins, so project files override user files, and user files override bundled ones.
+
+| Scope | Skills | Agent skills |
+|---|---|---|
+| Project (workspace) | `.agents/skills/`, `.claude/skills/`, `.github/skills/` | `.agents/agents/`, `.claude/agents/`, `.github/agents/` (`*.md`, `*.agent.md`) |
+| User | `~/.agents/skills/`, `~/.claude/skills/`, `~/.copilot/skills/` | `~/.agents/agents/`, `~/.claude/agents/`, `~/.copilot/agents/` |
+| Bundled | `skills/` in this repo | `agents/` in this repo |
+
+Project-scope skills and agent skills may come from a repository you just cloned, so
+activating or delegating to one always asks for permission first. Every tool call a skill or
+sub-agent makes still goes through the normal permission gate.
+
+### Writing a skill
+
+```markdown
+---
+name: aws-inventory                 # lowercase-hyphen
+description: Inspect an AWS account... Use when the user asks about AWS resources or billing.
+allowed-tools: list_s3_buckets get_aws_billing   # gated tools this skill unlocks
+---
+# Instructions the agent follows after activating the skill
+```
+
+Only `name` and `description` sit in the system prompt (the catalog). The body is loaded
+when the model calls `activate_skill`, and files under the skill's folder are read only when the
+body points to them. GUI and AWS tools are **gated**: they're hidden from the model until
+a skill that lists them in `allowed-tools` is activated.
+
+### Writing an agent skill
+
+```markdown
+---
+name: code-reviewer
+description: Reviews changes for bugs without editing. Use after code changes.
+tools: read_file, search_repo, git_diff   # omit = all tools (list or comma string)
+skills: []                                # omit = all skills, [] = none
+model: inherit                            # or sonnet / opus / haiku / any model id
+max-iterations: 25
+---
+You are a senior code reviewer...         # this body is the agent's system prompt
+```
+
+Sub-agents can't delegate further (one level deep). An agent skill started with `--agent`
+can delegate only if it lists `delegate_to_agent` in `tools`.
+
+---
+
+## Tools
+
+GUI and AWS tools are gated behind the `desktop-gui` and `aws-inventory` skills (see above).
+
 
 ### Shell
 | Tool | Description |
@@ -169,7 +249,9 @@ Use `--yes` / `-y` to skip all prompts (useful for scripted/CI usage).
 ## Interactive REPL commands
 
 ```
-/tools         List all available tools
+/tools         List all tools (hidden ones are marked)
+/skills        List skills — /skills reload re-scans the folders
+/agents        List agent skills available for delegation
 /permissions   Show always-allowed / always-denied tools this session
 /tokens        Show token usage so far
 /history       Show conversation history
@@ -188,8 +270,17 @@ coding-agent/
 ├── config.py                    # Config dataclass (env-driven)
 ├── requirements.txt
 ├── .env.example
+├── skills/                      # Bundled skills (know-how): <name>/SKILL.md
+│   ├── desktop-gui/
+│   └── aws-inventory/
+├── agents/                      # Bundled agent skills (agents): <name>.md
+│   ├── code-reviewer.md
+│   └── api-tester.md
 └── agent/
-    ├── loop.py                  # Agent loop (AgentLoop class)
+    ├── loop.py                  # Agent loop (AgentLoop class); runs default agent or an agent skill
+    ├── skills.py                # Skill discovery, catalog
+    ├── agent_skills.py          # Agent skill discovery, catalog, model aliases
+    ├── frontmatter.py           # Shared YAML frontmatter parser
     ├── context.py               # Builds workspace context for the LLM
     ├── permissions.py           # Permission gate (ask/auto/deny tiers)
     ├── llm/
@@ -202,7 +293,8 @@ coding-agent/
         ├── files.py             # read_file, write_file, list_files, search_repo
         ├── git.py               # git_status/diff/add/commit/log/clone
         ├── env.py               # install_maven/node/python_package, run_tests
-        └── aws.py               # S3, Cost Explorer, EC2
+        ├── aws.py               # S3, Cost Explorer, EC2 (gated)
+        └── gui.py               # Desktop automation (gated)
 ```
 
 ---

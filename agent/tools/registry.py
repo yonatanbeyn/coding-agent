@@ -9,9 +9,17 @@ from agent.llm.base import ToolDef
 class ToolRegistry:
     """Registry of all tools available to the agent."""
 
-    def __init__(self, workspace: str, enable_aws: bool = True):
+    def __init__(self, workspace: str, enable_aws: bool = True, allowed: list[str] | None = None):
         self.workspace = workspace
         self._tools: dict[str, ToolDef] = {}
+        # Gated tools stay hidden from the LLM until a skill that lists them in
+        # `allowed-tools` is activated (progressive disclosure).
+        self._gated: set[str] = set()
+        self._unlocked: set[str] = set()
+        # Allowlist from an agent skill's `tools:` field; None = every tool.
+        self._allowed: set[str] | None = set(allowed) if allowed is not None else None
+        # Skill / agent-skill tools added by the agent loop; never filtered by the allowlist.
+        self._meta: set[str] = set()
         self._register_all(enable_aws)
 
     def _register_all(self, enable_aws: bool) -> None:
@@ -152,28 +160,28 @@ class ToolRegistry:
         if enable_aws:
             from agent.tools import aws
 
-            self.register(ToolDef(
+            self.register(gated=True, tool=ToolDef(
                 name="list_s3_buckets",
                 description="List all S3 buckets in the AWS account. Requires AWS credentials.",
                 parameters=aws.LIST_S3_SCHEMA,
                 fn=lambda: aws.list_s3_buckets(),
             ))
 
-            self.register(ToolDef(
+            self.register(gated=True, tool=ToolDef(
                 name="get_aws_billing",
                 description="Get AWS billing/cost data for the last N days. Optionally filter by service name.",
                 parameters=aws.GET_BILLING_SCHEMA,
                 fn=lambda service=None, days=7: aws.get_aws_billing(service, days),
             ))
 
-            self.register(ToolDef(
+            self.register(gated=True, tool=ToolDef(
                 name="list_ec2_instances",
                 description="List EC2 instances with their state, type, and availability zone.",
                 parameters=aws.LIST_EC2_SCHEMA,
                 fn=lambda region=None: aws.list_ec2_instances(region),
             ))
 
-            self.register(ToolDef(
+            self.register(gated=True, tool=ToolDef(
                 name="get_s3_bucket_size",
                 description="Get total size and object count of an S3 bucket.",
                 parameters=aws.GET_S3_SIZE_SCHEMA,
@@ -186,35 +194,35 @@ class ToolRegistry:
     def _register_gui(self) -> None:
         from agent.tools import gui
 
-        self.register(ToolDef(
+        self.register(gated=True, tool=ToolDef(
             name="open_app",
             description="Open any macOS application by name (Postman, IntelliJ IDEA, Chrome, Slack, etc.).",
             parameters=gui.OPEN_APP_SCHEMA,
             fn=lambda name, wait=1.5: gui.open_app(name, wait),
         ))
 
-        self.register(ToolDef(
+        self.register(gated=True, tool=ToolDef(
             name="focus_app",
             description="Bring an already-running app to the foreground. Call this before screenshot when you need to capture a specific app.",
             parameters=gui.FOCUS_APP_SCHEMA,
             fn=lambda name, wait=1.0: gui.focus_app(name, wait),
         ))
 
-        self.register(ToolDef(
+        self.register(gated=True, tool=ToolDef(
             name="screenshot",
             description="Take a full-screen screenshot. Returns the file path and screen dimensions. Pass focus='AppName' to bring an app to front first.",
             parameters=gui.SCREENSHOT_SCHEMA,
             fn=lambda save_path=None, focus=None: gui.screenshot(save_path, focus),
         ))
 
-        self.register(ToolDef(
+        self.register(gated=True, tool=ToolDef(
             name="mouse_click",
             description="Click at x,y screen coordinates. Use vision_find first to get coordinates.",
             parameters=gui.MOUSE_CLICK_SCHEMA,
             fn=lambda x, y, button="left", double=False: gui.mouse_click(x, y, button, double),
         ))
 
-        self.register(ToolDef(
+        self.register(gated=True, tool=ToolDef(
             name="click_and_type",
             description=(
                 "Click a UI element at (x, y) and immediately type text into it — all in one step. "
@@ -225,21 +233,21 @@ class ToolRegistry:
             fn=lambda x, y, text, focus=None: gui.click_and_type(x, y, text, focus),
         ))
 
-        self.register(ToolDef(
+        self.register(gated=True, tool=ToolDef(
             name="keyboard_type",
             description="Type text into the currently focused UI element. Handles unicode and special characters.",
             parameters=gui.KEYBOARD_TYPE_SCHEMA,
             fn=lambda text, focus=None, clear=True: gui.keyboard_type(text, focus, clear),
         ))
 
-        self.register(ToolDef(
+        self.register(gated=True, tool=ToolDef(
             name="keyboard_hotkey",
             description='Press a key combination. E.g. ["cmd","t"] = new tab, ["cmd","space"] = Spotlight, ["cmd","q"] = quit.',
             parameters=gui.KEYBOARD_HOTKEY_SCHEMA,
             fn=lambda keys: gui.keyboard_hotkey(keys),
         ))
 
-        self.register(ToolDef(
+        self.register(gated=True, tool=ToolDef(
             name="vision_find",
             description=(
                 "Take a screenshot and use Claude vision to locate any UI element by description. "
@@ -250,14 +258,44 @@ class ToolRegistry:
             fn=lambda description, then_click=False, focus=None: gui.vision_find(description, then_click, focus),
         ))
 
-    def register(self, tool: ToolDef) -> None:
+    def register(self, tool: ToolDef, gated: bool = False, meta: bool = False) -> None:
         self._tools[tool.name] = tool
+        if gated:
+            self._gated.add(tool.name)
+        if meta:
+            self._meta.add(tool.name)
+
+    def unlock(self, names: list[str]) -> list[str]:
+        """Expose gated tools (called when a skill is activated). Returns newly unlocked names."""
+        new = [n for n in names if n in self._gated and n not in self._unlocked]
+        self._unlocked.update(new)
+        return new
+
+    def reset_unlocked(self) -> None:
+        self._unlocked.clear()
+
+    def is_visible(self, name: str) -> bool:
+        if name not in self._tools:
+            return False
+        # Unlocked tools come from a skill this agent is allowed to activate,
+        # so they are visible even when not in the agent skill's `tools:` list.
+        if name in self._meta or name in self._unlocked:
+            return True
+        if self._allowed is not None:
+            # An agent skill that names a gated tool in `tools:` gets it without a skill.
+            return name in self._allowed
+        return name not in self._gated
 
     def get(self, name: str) -> ToolDef | None:
-        return self._tools.get(name)
+        return self._tools.get(name) if self.is_visible(name) else None
 
     def all(self) -> list[ToolDef]:
-        return list(self._tools.values())
+        """Tools currently offered to the LLM."""
+        return [t for name, t in self._tools.items() if self.is_visible(name)]
+
+    def all_registered(self) -> list[tuple[ToolDef, bool]]:
+        """Every registered tool with its visibility (for /tools)."""
+        return [(t, self.is_visible(name)) for name, t in self._tools.items()]
 
     def execute(self, name: str, arguments: dict) -> str:
         """Execute a tool by name with given arguments. Returns string result."""

@@ -34,6 +34,10 @@ _DEFAULT_TIERS: dict[str, PermissionTier] = {
     "git_diff":             PermissionTier.AUTO_ALLOW,
     "git_log":              PermissionTier.AUTO_ALLOW,
 
+    # ── Skills / agent skills (project-scope ones are escalated to ASK by the loop) ──
+    "activate_skill":       PermissionTier.AUTO_ALLOW,
+    "delegate_to_agent":    PermissionTier.AUTO_ALLOW,
+
     # ── GUI automation (always ask — controls the whole screen) ──
     "open_app":                PermissionTier.ASK,
     "mouse_click":             PermissionTier.ASK,
@@ -81,11 +85,13 @@ class PermissionManager:
         self._session_always_deny: set[str] = set()
         self._auto_allow_all = auto_allow_all  # --yes / -y flag
 
-    def check(self, tool_name: str, arguments: dict) -> Decision:
+    def check(self, tool_name: str, arguments: dict, tier: PermissionTier | None = None) -> Decision:
         """
         Check whether a tool call should be allowed.
 
-        Returns a Decision. If ASK, prints a prompt and waits for input.
+        `tier` overrides the default tier for this call (e.g. a skill that came
+        from an untrusted, freshly cloned repo). Returns a Decision. If ASK,
+        prints a prompt and waits for input.
         """
         # Session overrides take priority
         if tool_name in self._session_always_allow:
@@ -96,7 +102,7 @@ class PermissionManager:
             _print_auto(tool_name, arguments, "always denied")
             return Decision.DENIED_ALWAYS
 
-        tier = _DEFAULT_TIERS.get(tool_name, PermissionTier.ASK)
+        tier = tier or _DEFAULT_TIERS.get(tool_name, PermissionTier.ASK)
 
         if tier == PermissionTier.AUTO_ALLOW or self._auto_allow_all:
             _print_auto(tool_name, arguments, "auto")

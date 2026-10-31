@@ -36,6 +36,8 @@ Examples:
   python main.py --provider ollama --model llama3.2  Use local Ollama
   python main.py --workspace /path/to/project      Set working directory
   python main.py --no-aws "..."                    Disable AWS tools
+  python main.py --agent code-reviewer "..."       Run as an agent skill
+  python main.py --list-skills                     Show skills and agent skills
         """,
     )
 
@@ -71,6 +73,16 @@ Examples:
         "--no-stream",
         action="store_true",
         help="Disable streaming output",
+    )
+    parser.add_argument(
+        "--agent",
+        metavar="NAME",
+        help="Run the session as an agent skill (agents/*.md, .claude/agents/, .github/agents/)",
+    )
+    parser.add_argument(
+        "--list-skills",
+        action="store_true",
+        help="List discovered skills and agent skills, then exit",
     )
     parser.add_argument(
         "--yes", "-y",
@@ -110,7 +122,15 @@ Examples:
     if args.no_stream:
         config.stream = False
 
-    agent = AgentLoop(config, enable_aws=not args.no_aws, auto_allow_all=args.yes)
+    if args.list_skills:
+        _list_skills(config.workspace)
+        return
+
+    try:
+        agent = AgentLoop(config, enable_aws=not args.no_aws, auto_allow_all=args.yes, agent_skill=args.agent)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
     if args.prompt:
         agent.run(" ".join(args.prompt))
@@ -118,6 +138,23 @@ Examples:
         agent.interactive(skip_context_inject=True)
     else:
         agent.interactive()
+
+
+def _list_skills(workspace: str) -> None:
+    from agent.skills import discover_skills
+    from agent.agent_skills import discover_agent_skills
+
+    skills, skill_problems = discover_skills(workspace)
+    agents, agent_problems = discover_agent_skills(workspace)
+
+    print("Skills — know-how loaded into the running agent:")
+    for s in skills.values():
+        print(f"  {s.name:<24} {s.scope:<8} {s.path}")
+    print("\nAgent skills — agents you can run (--agent) or delegate to:")
+    for a in agents.values():
+        print(f"  {a.name:<24} {a.scope:<8} {a.path}")
+    for problem in skill_problems + agent_problems:
+        print(f"  skipped: {problem}")
 
 
 if __name__ == "__main__":
