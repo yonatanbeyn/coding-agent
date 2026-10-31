@@ -7,7 +7,6 @@ Supports both Anthropic and OpenAI-compatible providers.
 import json
 import sys
 import time
-from dataclasses import replace
 from typing import Callable
 
 from rich.console import Console
@@ -19,12 +18,16 @@ from rich.text import Text
 
 from config import Config
 from agent.context import build_context
-from agent.llm.base import LLMResponse, ToolCall, ToolDef
+from agent.llm.base import LLMResponse, ToolCall
 from agent.tools.registry import ToolRegistry
 from agent.permissions import Decision, PermissionManager, PermissionTier
 from agent.session import save_workspace
-from agent.skills import Skill, discover_skills, skills_catalog
-from agent.agent_skills import AgentSkill, agent_skills_catalog, discover_agent_skills
+from agent.skills import Skill
+from agent.agent_skills import AgentSkill
+from agent.capabilities import (
+    MAX_DEPTH, MAX_PARALLEL, compose_system_prompt, find_agent_skill, meta_tool_defs,
+    resolve_setup, skill_activation_result, subagent_first_message,
+)
 
 console = Console()
 
@@ -50,40 +53,18 @@ def _build_messages_for_provider(history: list[dict], provider: str) -> list[dic
     return build_openai_messages(history)
 
 
-ACTIVATE_SKILL_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "name": {"type": "string", "description": "Skill name from the Skills catalog"},
-    },
-    "required": ["name"],
-}
-
-DELEGATE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "agent": {"type": "string", "description": "Agent skill name from the Agent skills catalog"},
-        "task": {
-            "type": "string",
-            "description": "Complete, self-contained task. The sub-agent cannot see this conversation.",
-        },
-    },
-    "required": ["agent", "task"],
-}
-
-
 class AgentLoop:
-    """Runs one agent.
+    """Runs one agent in this process.
 
     With `agent_skill=None` this is the default coding agent. With an AgentSkill
     the loop *becomes* that agent: its body is the system prompt, its `tools:`
     is the tool allowlist, its `skills:` limits which skills it can activate,
     and its `model:` overrides the model. Sub-agents (depth > 0) are created
-    the same way by `delegate_to_agent`.
+    the same way by `delegate_to_agent`. For durable, parallel teams see
+    agent/durable/ (the same agents running as Temporal workflows).
     """
 
-    # main agent → team lead → workers. Below the top level only agent skills that
-    # list `delegate_to_agent` in `tools:` can delegate, and never past this depth.
-    MAX_DEPTH = 2
+    MAX_DEPTH = MAX_DEPTH
 
     def __init__(
         self,
@@ -104,22 +85,9 @@ class AgentLoop:
         self.total_output_tokens = 0
 
         if isinstance(agent_skill, str):
-            found, _ = discover_agent_skills(config.workspace)
-            if agent_skill not in found:
-                available = ", ".join(sorted(found)) or "none"
-                raise ValueError(f"Unknown agent skill {agent_skill!r}. Available: {available}")
-            agent_skill = found[agent_skill]
+            agent_skill = find_agent_skill(config.workspace, agent_skill)
         self.agent_skill: AgentSkill | None = agent_skill
-
-        if agent_skill:
-            config = replace(
-                config,
-                system_prompt=agent_skill.system_prompt,
-                model=agent_skill.resolve_model(config.provider, config.model),
-                max_iterations=agent_skill.max_iterations or config.max_iterations,
-            )
-        self.config = config
-        self.client = _make_client(config)
+        self._base_config = config
         self._setup_capabilities()
 
     # ──────────────────────────────────────────────────────────────
@@ -128,58 +96,27 @@ class AgentLoop:
 
     def _setup_capabilities(self) -> None:
         """(Re)build tools, skills and agent skills for the current workspace."""
-        ws = self.config.workspace
-        allowed_tools = self.agent_skill.tools if self.agent_skill else None
-        self.registry = ToolRegistry(ws, enable_aws=self.enable_aws, allowed=allowed_tools)
-
-        # Skills: know-how this agent can load into itself.
-        all_skills, skill_problems = discover_skills(ws)
-        wanted = self.agent_skill.skills if self.agent_skill else None
-        self.skills: dict[str, Skill] = (
-            all_skills if wanted is None else {n: s for n, s in all_skills.items() if n in wanted}
-        )
-
-        # Agent skills: other agents this agent can delegate to.
-        all_agents, agent_problems = discover_agent_skills(ws)
-        can_delegate = self.depth < self.MAX_DEPTH and (
-            self.agent_skill is None
-            or (allowed_tools is not None and "delegate_to_agent" in allowed_tools)
-        )
-        self.agent_skills: dict[str, AgentSkill] = {}
-        if can_delegate:
-            me = self.agent_skill.name if self.agent_skill else None
-            # Never offer an agent itself or a caller up the chain (no A → B → A loops).
-            excluded = {me, *self._callers}
-            self.agent_skills = {n: a for n, a in all_agents.items() if n not in excluded}
-
-        self.capability_problems = skill_problems + agent_problems
+        setup = resolve_setup(self._base_config, self.agent_skill, self.depth, self._callers)
+        self.config = setup.config
+        self.client = _make_client(self.config)
+        self.registry = ToolRegistry(self.config.workspace, enable_aws=self.enable_aws, allowed=setup.allowed_tools)
+        self.skills: dict[str, Skill] = setup.skills
+        self.agent_skills: dict[str, AgentSkill] = setup.agent_skills
+        self.capability_problems = setup.problems
         self.active_skills: list[str] = []
 
-        if self.skills:
-            self.registry.register(meta=True, tool=ToolDef(
-                name="activate_skill",
-                description=(
-                    "Load a skill's full instructions into your context (and unlock the tools it "
-                    "needs). Call this before working on a task that a listed skill covers."
-                ),
-                parameters=ACTIVATE_SKILL_SCHEMA,
-                fn=self._activate_skill,
-            ))
-        if self.agent_skills:
-            self.registry.register(meta=True, tool=ToolDef(
-                name="delegate_to_agent",
-                description=(
-                    "Hand a task to an agent skill (a sub-agent with its own instructions, tools and "
-                    "model). It runs to completion in a separate context and returns its final answer."
-                ),
-                parameters=DELEGATE_SCHEMA,
-                fn=self._delegate_to_agent,
-            ))
+        handlers = {
+            "activate_skill": self._activate_skill,
+            "delegate_to_agent": self._delegate_to_agent,
+            "delegate_parallel": self._delegate_parallel,
+        }
+        for tool in meta_tool_defs(bool(self.skills), bool(self.agent_skills)):
+            tool.fn = handlers[tool.name]
+            self.registry.register(tool, meta=True)
 
     @property
     def system_prompt(self) -> str:
-        sections = [self.config.system_prompt, skills_catalog(self.skills), agent_skills_catalog(self.agent_skills)]
-        return "\n\n".join(s for s in sections if s)
+        return compose_system_prompt(self.config.system_prompt, self.skills, self.agent_skills)
 
     def _activate_skill(self, name: str) -> dict:
         skill = self.skills.get(name)
@@ -189,13 +126,7 @@ class AgentLoop:
         if name not in self.active_skills:
             self.active_skills.append(name)
         console.print(f"[magenta]◆ Skill activated:[/magenta] [bold]{name}[/bold] [dim]({skill.scope})[/dim]")
-        result = {
-            "skill": skill.name,
-            "base_dir": str(skill.path),
-            "instructions": skill.body,
-            "resources": skill.resources(),
-            "note": "Resource paths are relative to base_dir. Read them or run scripts only when needed.",
-        }
+        result = skill_activation_result(skill)
         if unlocked:
             result["tools_unlocked"] = unlocked
         missing = [t for t in skill.allowed_tools if not self.registry.is_visible(t)]
@@ -209,7 +140,7 @@ class AgentLoop:
             return {"error": f"Unknown agent skill {agent!r}. Available: {', '.join(sorted(self.agent_skills)) or 'none'}"}
 
         sub = AgentLoop(
-            self.config,
+            self._base_config,
             enable_aws=self.enable_aws,
             agent_skill=target,
             permissions=self.permissions,   # same user, same session approvals
@@ -218,7 +149,7 @@ class AgentLoop:
         )
         sub.history = [{
             "role": "user",
-            "content": f"Workspace context:\n{build_context(self.config.workspace)}\n\nTask:\n{task}",
+            "content": subagent_first_message(build_context(self.config.workspace), task),
         }]
 
         console.print(Rule(f"[bold magenta]→ agent skill: {target.name}[/bold magenta] · {sub.config.model}"))
@@ -230,6 +161,16 @@ class AgentLoop:
             console.print(Rule(f"[bold magenta]← back from {target.name}[/bold magenta]"))
 
         return {"agent": target.name, "result": answer or "(the sub-agent returned no text)"}
+
+    def _delegate_parallel(self, tasks: list[dict]) -> dict:
+        """In-process runtime: same contract as the durable one, but runs the tasks in sequence."""
+        if not tasks or len(tasks) > MAX_PARALLEL:
+            return {"error": f"Pass between 1 and {MAX_PARALLEL} tasks."}
+        console.print(
+            f"[dim]delegate_parallel: running {len(tasks)} task(s) one after another "
+            f"(use --durable for real parallelism)[/dim]"
+        )
+        return {"results": [self._delegate_to_agent(t.get("agent", ""), t.get("task", "")) for t in tasks]}
 
     # ──────────────────────────────────────────────────────────────
     # Public API
@@ -477,6 +418,10 @@ class AgentLoop:
             item = self.skills.get(tc.arguments.get("name", ""))
         elif tc.name == "delegate_to_agent":
             item = self.agent_skills.get(tc.arguments.get("agent", ""))
+        elif tc.name == "delegate_parallel":
+            names = [t.get("agent", "") for t in tc.arguments.get("tasks", []) if isinstance(t, dict)]
+            project = any(self.agent_skills.get(n) and self.agent_skills[n].scope == "project" for n in names)
+            return PermissionTier.ASK if project else None
         else:
             return None
         return PermissionTier.ASK if item and item.scope == "project" else None
@@ -595,7 +540,7 @@ class AgentLoop:
             if not _os.path.isdir(new_path):
                 console.print(f"[red]Not a directory:[/red] {new_path}")
                 return True
-            self.config.workspace = new_path
+            self._base_config.workspace = new_path
             self._setup_capabilities()
             save_workspace(new_path)
             context = build_context(new_path)

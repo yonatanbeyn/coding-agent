@@ -32,6 +32,10 @@ class Config:
     system_prompt: str = SYSTEM_PROMPT
     stream: bool = True
     enable_aws: bool = True
+    # Durable runtime (Temporal) — used by --worker, --durable and --attach
+    temporal_address: str = "localhost:7233"
+    temporal_namespace: str = "default"
+    temporal_task_queue: str = "coding-agent"
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -57,4 +61,7 @@ class Config:
             workspace=os.path.abspath(os.getenv("AGENT_WORKSPACE", os.getcwd())),
             max_iterations=int(os.getenv("AGENT_MAX_ITERATIONS", "50")),
             stream=os.getenv("AGENT_STREAM", "true").lower() == "true",
+            temporal_address=os.getenv("TEMPORAL_ADDRESS", "localhost:7233"),
+            temporal_namespace=os.getenv("TEMPORAL_NAMESPACE", "default"),
+            temporal_task_queue=os.getenv("TEMPORAL_TASK_QUEUE", "coding-agent"),
         )

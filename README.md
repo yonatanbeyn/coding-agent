@@ -33,6 +33,26 @@ The LLM never executes anything directly. It produces structured tool calls; the
 
 ---
 
+## Two runtimes, same agents
+
+Every agent, skill and agent skill works in both runtimes. You pick the runtime per run:
+
+| | **In-process** (default) | **Durable** (`--durable`, Temporal) |
+|---|---|---|
+| Start | `python main.py "..."` | `python main.py --worker` once, then `python main.py --durable "..."` |
+| Where agents run | Inside your terminal process | In worker processes, as Temporal workflows |
+| Sub-agents | Function calls, one at a time | Child workflows, `delegate_parallel` runs them **at the same time** |
+| Crash / Ctrl+C / reboot | The run is lost | The run resumes from the last completed step |
+| LLM errors (429, 529, timeouts) | Run stops | Retried automatically with backoff |
+| Approvals | Prompt blocks the terminal | Durable wait (up to 24h); detach and approve later |
+| Streaming output | Yes | No: you see step-by-step progress instead |
+| Interactive REPL | Yes | No: one task per run |
+| Extra infra | None | A Temporal server (`temporal server start-dev` locally) |
+
+See **[Durable mode (Temporal)](#durable-mode-temporal)** for the full guide.
+
+---
+
 ## Quick start
 
 ```bash
@@ -87,6 +107,9 @@ python main.py [prompt] [flags]
   --no-stream  disable streaming output
   --agent      run the session as an agent skill (e.g. --agent code-reviewer)
   --list-skills  list discovered skills and agent skills, then exit
+  --worker     run a Temporal worker (durable mode)
+  --durable    run the task as a Temporal workflow (needs a running worker)
+  --attach ID  re-attach to a durable run: stream progress, answer approvals
 ```
 
 ---
@@ -186,8 +209,222 @@ python main.py --agent feature-lead "Add a /health endpoint with a test"
 python main.py "Add user login with tests"     # main agent can delegate to feature-lead
 ```
 
-Sub-agents run one at a time inside the same process. Delegation blocks until the sub-agent
-finishes. There's no parallel fan-out and no direct agent-to-agent messaging yet.
+Delegation tools available to agents that can delegate:
+
+| Tool | In-process runtime | Durable runtime |
+|---|---|---|
+| `delegate_to_agent(agent, task)` | Runs the sub-agent, waits for its answer | Child workflow, waits for its answer |
+| `delegate_parallel(tasks=[...])` (max 5) | Runs the tasks **one after another** | Child workflows running **at the same time** |
+
+Agents never message each other directly. Only the task goes down and the final answer
+comes back up; anything else goes through workspace files such as the team board.
+
+---
+
+## Durable mode (Temporal)
+
+Durable mode runs the same agents as [Temporal](https://temporal.io) workflows. Use it for
+long tasks, agent teams, parallel sub-agents, or anything you don't want to lose to a crash,
+a closed laptop or an LLM outage.
+
+### Quick start
+
+```bash
+pip install -r requirements.txt            # includes temporalio
+
+# Terminal 1: a local Temporal server (UI at http://localhost:8233)
+temporal server start-dev --db-filename temporal.db   # install: brew install temporal (docs.temporal.io/cli)
+
+# Terminal 2: a worker. It executes LLM calls and tools, so run it where the workspace is
+python main.py --worker
+
+# Terminal 3: start a task
+python main.py --durable "Add a /health endpoint with a test"
+python main.py --durable --agent feature-lead "Add user login with tests"
+python main.py --durable --yes "..."       # never wait for approvals
+
+# Ctrl+C detaches; the run keeps going. Re-attach any time:
+python main.py --attach coding-agent-1a2b3c4d
+```
+
+### Architecture
+
+```
+ ┌──────────────────────┐   start / query / signal   ┌──────────────────────────┐
+ │  Client (terminal)   │ ─────────────────────────▶ │     Temporal server      │
+ │  main.py --durable   │ ◀───────────────────────── │  event history per run   │
+ │  main.py --attach    │   status, pending approvals│  timers, retries, queues │
+ └──────────────────────┘                            └────────────┬─────────────┘
+   • prints progress of every agent                               │ task queue
+   • asks you to approve tools                                    │ "coding-agent"
+   • holds NO agent state (safe to close)                         ▼
+                                              ┌────────────────────────────────────┐
+                                              │  Worker  (main.py --worker)        │
+                                              │                                    │
+                                              │  AgentWorkflow  (deterministic)    │
+                                              │    the agent loop: decide next step│
+                                              │                                    │
+                                              │  Activities  (side effects)        │
+                                              │    load_agent_setup  skills/agents │
+                                              │    llm_complete      model call    │
+                                              │    run_tool          shell/files/… │
+                                              │                                    │
+                                              │  thread pool: N activities at once │
+                                              └──────────────┬─────────────────────┘
+                                                             │
+                                          workspace files, git, shell, AWS, desktop
+```
+
+Temporal records the result of every activity in the run's **event history**. If a worker
+dies, another worker (or the same one after a restart) replays the history: completed LLM
+calls and tools are *not* repeated, and the agent continues from the exact step it was on.
+API keys stay in the worker's environment and never appear in the history.
+
+### How one agent runs
+
+```
+AgentWorkflow.run(AgentInput)
+ │
+ ├─ activity load_agent_setup ──▶ agent skill + skills + delegation targets + system prompt
+ │
+ └─ loop (max_iterations)
+      │
+      ├─ activity llm_complete ──▶ retried with backoff (2s → 1m, 6 attempts)
+      │
+      ├─ no tool calls? ──▶ return AgentResult(final_text, steps, tokens)
+      │
+      └─ for each tool call
+           ├─ activate_skill      handled in the workflow: unlock tools, return SKILL.md body
+           ├─ delegate_to_agent   ──▶ child AgentWorkflow, wait for its result
+           ├─ delegate_parallel   ──▶ up to 5 child AgentWorkflows, gathered concurrently
+           └─ any other tool
+                ├─ needs approval? ──▶ pending approval, wait for `decide` signal (≤ 24h)
+                └─ activity run_tool ──▶ executed ONCE (no retry: tools have side effects)
+```
+
+### A team run: parallel sub-agents as child workflows
+
+```
+coding-agent-1a2b3c4d                         main agent          (depth 0)
+ └─ coding-agent-1a2b3c4d.1-feature-lead      team lead           (depth 1)
+     ├─ ….1-feature-lead.1-implementer        worker              (depth 2)
+     │
+     │   delegate_parallel ─────────────────────────┐
+     ├─ ….1-feature-lead.2-code-reviewer   ◀─┐      │  started together,
+     └─ ….1-feature-lead.3-api-tester      ◀─┴──────┘  lead waits for both
+
+time ─────────────────────────────────────────────────────────────▶
+lead          plan ── implementer ─────── gather( reviewer , tester ) ── report
+implementer         ███████████
+code-reviewer                           ██████████
+api-tester                              ████████████████
+```
+
+Workflow IDs are deterministic: `<parent id>.<n>-<agent name>`. Each one appears in the
+Temporal UI with its full history of LLM calls, tool calls, approvals and results.
+
+### Approvals
+
+The permission tiers are the same as in-process (auto-allow, ask, deny; project-scope skills
+and agent skills always ask). In durable mode, an "ask" becomes a durable wait:
+
+```
+ AgentWorkflow (any depth)            Temporal                  Client (--durable / --attach)
+ ─────────────────────────            ────────                  ─────────────────────────────
+ tool needs approval
+ pending[call_id] = {tool, args}
+ state = waiting_for_approval
+ wait_condition(decided) ─────┐                                 every 1s: query status
+         (durable, ≤ 24h)     │  ◀─── query status ───────────  walks main → children tree
+                              │  ──── pending approvals ──────▶ shows tool + arguments
+                              │                                 Allow? (y/a/n/d)
+                              │  ◀─── signal decide(call_id) ── 
+ decision received ◀──────────┘
+ run_tool or report denial to the LLM
+```
+
+- **No client attached?** The agent just waits. Attach later and answer the prompt.
+- **"Always allow" / "always deny"** are remembered by the client for that session.
+- **No answer in 24h** means the call is denied, and the agent is told so.
+- **`--yes`** skips all approvals; use it only in sandboxes.
+
+### Crash and restart behaviour
+
+| What happens | Result |
+|---|---|
+| You press Ctrl+C in the client | Client detaches. Agents keep running. `--attach <id>` to resume watching |
+| Client machine sleeps or reboots | Same as above |
+| Worker process crashes / is restarted | Run resumes on the next available worker from the last completed step |
+| Worker dies **during** a tool | That tool is not re-run automatically. The agent is told it didn't complete and decides what to do |
+| LLM API returns 429/529/5xx or times out | Retried up to 6 times with exponential backoff, then the agent stops with the error |
+| Temporal server restarts | Runs continue, because the server persists history. `temporal server start-dev` keeps it in memory unless you pass `--db-filename temporal.db` |
+
+### Scaling and placement
+
+```
+                    ┌────────── Temporal server ──────────┐
+                    │  task queue: coding-agent           │
+                    └───────┬──────────────┬──────────────┘
+                            │              │
+                ┌───────────▼───┐   ┌──────▼────────┐
+                │ worker A      │   │ worker B      │   same queue = shared load,
+                │ (your Mac)    │   │ (build box)   │   failover between them
+                └───────────────┘   └───────────────┘
+```
+
+- **Workspace access:** tools act on the worker's filesystem, so every worker on a queue
+  must see the workspace at the same path (same machine, or a shared/cloned checkout).
+- **GUI skills** (`desktop-gui`) must run on the Mac whose screen they control. Give that
+  machine its own queue (`TEMPORAL_TASK_QUEUE=my-mac`) and start runs on it.
+- **Concurrency:** `TEMPORAL_MAX_CONCURRENT_ACTIVITIES` (default 10) caps how many LLM calls
+  and tools one worker runs at once across all parallel sub-agents.
+- **Parallel agents share one workspace.** Only send independent tasks to
+  `delegate_parallel`, never two agents editing the same files, and never two GUI tasks at once.
+
+### Configuration
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TEMPORAL_ADDRESS` | `localhost:7233` | Temporal frontend (`<ns>.tmprl.cloud:7233` for Temporal Cloud) |
+| `TEMPORAL_NAMESPACE` | `default` | Namespace |
+| `TEMPORAL_TASK_QUEUE` | `coding-agent` | Queue that workers poll and runs are started on |
+| `TEMPORAL_MAX_CONCURRENT_ACTIVITIES` | `10` | Activities one worker runs in parallel |
+
+Provider settings (`AGENT_PROVIDER`, `AGENT_MODEL`, API keys) are read by the **client**
+(to choose provider and model for the run) and by the **worker** (for the API key).
+
+### Limits
+
+- **One task per run.** No interactive REPL and no follow-up messages in durable mode yet.
+- **No token streaming.** You see each step as it completes.
+- **History size.** The whole conversation is passed to each `llm_complete` call, so very
+  long runs grow the event history (Temporal's limits are 2 MB per payload and 50 MB per
+  run). Use `--max-iterations` and break big jobs into a team.
+- **Delegation depth** is 2 (main → lead → workers), the same as in-process.
+
+### Testing
+
+`tests/test_durable.py` runs the real workflow, activities and client watcher against a local
+Temporal dev server, using a scripted fake LLM (no API key needed). It checks that parallel
+sub-agents overlap in time and that a run survives its worker being stopped mid-run:
+
+```bash
+python tests/test_durable.py                         # SDK downloads the dev server
+TEMPORAL_CLI_PATH=$(which temporal) python tests/test_durable.py
+```
+
+### Code map
+
+```
+agent/durable/
+├── workflow.py    AgentWorkflow: deterministic loop, approvals, child workflows, status query
+├── activities.py  load_agent_setup · llm_complete · run_tool  (all I/O lives here)
+├── worker.py      Worker setup: sandbox pass-through, thread pool          (--worker)
+├── client.py      start / attach, progress tree, approval prompts          (--durable, --attach)
+└── types.py       dataclass payloads stored in workflow history
+agent/capabilities.py   shared by both runtimes: agent skill → config, skills, delegation, meta-tools
+tests/test_durable.py   end-to-end test against a local Temporal dev server
+```
 
 ---
 
@@ -305,7 +542,9 @@ coding-agent/
 │   ├── code-reviewer.md
 │   └── api-tester.md
 └── agent/
-    ├── loop.py                  # Agent loop (AgentLoop class); runs default agent or an agent skill
+    ├── loop.py                  # In-process agent loop (AgentLoop); default agent or an agent skill
+    ├── capabilities.py          # Shared by both runtimes: setup, catalogs, meta-tools
+    ├── durable/                 # Temporal runtime: workflow, activities, worker, client
     ├── skills.py                # Skill discovery, catalog
     ├── agent_skills.py          # Agent skill discovery, catalog, model aliases
     ├── frontmatter.py           # Shared YAML frontmatter parser
@@ -348,6 +587,12 @@ AGENT_STREAM=true
 AWS_ACCESS_KEY_ID=
 AWS_SECRET_ACCESS_KEY=
 AWS_DEFAULT_REGION=us-east-1
+
+# Durable mode (Temporal)
+TEMPORAL_ADDRESS=localhost:7233
+TEMPORAL_NAMESPACE=default
+TEMPORAL_TASK_QUEUE=coding-agent
+TEMPORAL_MAX_CONCURRENT_ACTIVITIES=10
 ```
 
 ---
@@ -377,3 +622,5 @@ You> The tests in ./auth are failing, find and fix the issue
 - Python 3.11+
 - At least one of: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or Ollama running locally
 - AWS tools require `boto3` and configured AWS credentials (optional)
+- Durable mode requires `temporalio` and a Temporal server: `temporal server start-dev`
+  locally, a self-hosted cluster, or Temporal Cloud (optional)

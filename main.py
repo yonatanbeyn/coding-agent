@@ -38,6 +38,12 @@ Examples:
   python main.py --no-aws "..."                    Disable AWS tools
   python main.py --agent code-reviewer "..."       Run as an agent skill
   python main.py --list-skills                     Show skills and agent skills
+
+Durable mode (Temporal — parallel sub-agents, crash-safe, resumable):
+  python main.py --worker                          Start a worker (keep it running)
+  python main.py --durable "Build login"           Run a task as a Temporal workflow
+  python main.py --durable --agent feature-lead "..."
+  python main.py --attach coding-agent-1a2b3c4d    Re-attach to a running task
         """,
     )
 
@@ -85,6 +91,21 @@ Examples:
         help="List discovered skills and agent skills, then exit",
     )
     parser.add_argument(
+        "--durable",
+        action="store_true",
+        help="Run the task as a Temporal workflow (needs a running worker: --worker)",
+    )
+    parser.add_argument(
+        "--worker",
+        action="store_true",
+        help="Run a Temporal worker that executes durable agent runs",
+    )
+    parser.add_argument(
+        "--attach",
+        metavar="WORKFLOW_ID",
+        help="Re-attach to a durable run: stream its progress and answer approvals",
+    )
+    parser.add_argument(
         "--yes", "-y",
         action="store_true",
         help="Auto-approve all tool calls without prompting (use with caution)",
@@ -126,6 +147,10 @@ Examples:
         _list_skills(config.workspace)
         return
 
+    if args.worker or args.durable or args.attach:
+        _run_durable_mode(args, config)
+        return
+
     try:
         agent = AgentLoop(config, enable_aws=not args.no_aws, auto_allow_all=args.yes, agent_skill=args.agent)
     except ValueError as e:
@@ -138,6 +163,41 @@ Examples:
         agent.interactive(skip_context_inject=True)
     else:
         agent.interactive()
+
+
+def _run_durable_mode(args, config) -> None:
+    import asyncio
+
+    try:
+        if args.worker:
+            from agent.durable.worker import run_worker
+            asyncio.run(run_worker(config))
+            return
+
+        from agent.durable.client import run_durable
+        prompt = " ".join(args.prompt) if args.prompt else None
+        if args.durable and not prompt:
+            print("Error: --durable needs a task, e.g. python main.py --durable \"Add a health endpoint\"",
+                  file=sys.stderr)
+            sys.exit(1)
+        asyncio.run(run_durable(
+            config,
+            prompt,
+            agent_skill=args.agent,
+            enable_aws=not args.no_aws,
+            auto_allow_all=args.yes,
+            attach_id=args.attach,
+        ))
+    except KeyboardInterrupt:
+        pass
+    except ImportError as e:
+        print(f"Error: durable mode needs temporalio (pip install -r requirements.txt): {e}", file=sys.stderr)
+        sys.exit(1)
+    except RuntimeError as e:
+        # Client.connect raises RuntimeError when no Temporal server is reachable.
+        print(f"Error: cannot reach Temporal at {config.temporal_address}: {e}\n"
+              f"Start one with: temporal server start-dev", file=sys.stderr)
+        sys.exit(1)
 
 
 def _list_skills(workspace: str) -> None:

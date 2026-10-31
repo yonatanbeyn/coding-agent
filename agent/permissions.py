@@ -37,6 +37,7 @@ _DEFAULT_TIERS: dict[str, PermissionTier] = {
     # ── Skills / agent skills (project-scope ones are escalated to ASK by the loop) ──
     "activate_skill":       PermissionTier.AUTO_ALLOW,
     "delegate_to_agent":    PermissionTier.AUTO_ALLOW,
+    "delegate_parallel":    PermissionTier.AUTO_ALLOW,
 
     # ── GUI automation (always ask — controls the whole screen) ──
     "open_app":                PermissionTier.ASK,
@@ -62,6 +63,11 @@ _DEFAULT_TIERS: dict[str, PermissionTier] = {
     "list_ec2_instances":      PermissionTier.ASK,
     "get_s3_bucket_size":      PermissionTier.ASK,
 }
+
+
+def default_tier(tool_name: str) -> PermissionTier:
+    """Tier for a tool when no session override applies. Unknown tools must be asked about."""
+    return _DEFAULT_TIERS.get(tool_name, PermissionTier.ASK)
 
 
 def _format_args(arguments: dict) -> str:
@@ -102,7 +108,7 @@ class PermissionManager:
             _print_auto(tool_name, arguments, "always denied")
             return Decision.DENIED_ALWAYS
 
-        tier = tier or _DEFAULT_TIERS.get(tool_name, PermissionTier.ASK)
+        tier = tier or default_tier(tool_name)
 
         if tier == PermissionTier.AUTO_ALLOW or self._auto_allow_all:
             _print_auto(tool_name, arguments, "auto")
